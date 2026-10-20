@@ -1,0 +1,165 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"sing-box-rules/internal/generator"
+	"sing-box-rules/internal/githubapi"
+)
+
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
+	ctx := context.Background()
+	rootDir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
+	token := firstNonEmpty(os.Getenv("GITHUB_TOKEN"), os.Getenv("ACCESS_TOKEN"))
+	client := githubapi.New(token)
+
+	geositeRelease, err := client.LatestRelease(ctx, generator.GeositeUpstreamRepo)
+	if err != nil {
+		return fmt.Errorf("fetch geosite release: %w", err)
+	}
+
+	geoIPRelease, err := client.LatestRelease(ctx, generator.GeoIPUpstreamRepo)
+	if err != nil {
+		return fmt.Errorf("fetch geoip release: %w", err)
+	}
+
+	if err := setGitHubOutput("geosite_tag", geositeRelease.TagName); err != nil {
+		return err
+	}
+	if err := setGitHubOutput("geoip_tag", geoIPRelease.TagName); err != nil {
+		return err
+	}
+
+	if err := generator.PrepareDist(rootDir); err != nil {
+		return err
+	}
+
+	geositeManifest, geositeCount, err := generator.BuildGeosite(ctx, client, rootDir, geositeRelease)
+	if err != nil {
+		return err
+	}
+
+	geoIPManifest, geoIPCount, err := generator.BuildGeoIP(ctx, client, rootDir, geoIPRelease)
+	if err != nil {
+		return err
+	}
+
+	manifest := generator.Manifest{
+		GeneratedAt:    time.Now().UTC().Format(time.RFC3339),
+		SingBoxVersion: generator.SingBoxVersion,
+		RuleSetVersion: generator.RuleSetBinaryVersion,
+		Geosite:        geositeManifest,
+		GeoIP:          geoIPManifest,
+		Artifacts: generator.ArtifactManifest{
+			GeositeRuleSetCount: geositeCount,
+			GeoIPRuleSetCount:   geoIPCount,
+			GeositeDirectory:    generator.GeositeOutputDir,
+			GeoIPDirectory:      generator.GeoIPOutputDir,
+			GeositeBranch:       generator.GeositeBranch,
+			GeoIPBranch:         generator.GeoIPBranch,
+		},
+	}
+
+	if err := writeJSON(filepath.Join(rootDir, generator.ManifestPath), manifest); err != nil {
+		return err
+	}
+
+	if err := writeText(filepath.Join(rootDir, generator.ReleaseNotesPath), releaseNotes(manifest)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func setGitHubOutput(name string, value string) error {
+	outputPath := strings.TrimSpace(os.Getenv("GITHUB_OUTPUT"))
+	if outputPath == "" {
+		return nil
+	}
+
+	file, err := os.OpenFile(outputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = fmt.Fprintf(file, "%s=%s\n", name, value)
+	return err
+}
+
+func writeJSON(path string, value any) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetEscapeHTML(false)
+	encoder.SetIndent("", "  ")
+
+	return encoder.Encode(value)
+}
+
+func writeText(path string, content string) error {
+	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+func releaseNotes(manifest generator.Manifest) string {
+	return fmt.Sprintf(`# sing-box rules
+
+- sing-box version: %s
+- rule-set binary version: %d
+- geosite upstream: %s @ %s
+- geoip upstream: %s @ %s
+- geosite categories: %d
+- geoip categories: %d
+- geosite directory: dist/%s
+- geoip directory: dist/%s
+
+Published branches:
+
+- %s
+- %s
+`,
+		manifest.SingBoxVersion,
+		manifest.RuleSetVersion,
+		manifest.Geosite.Repository,
+		manifest.Geosite.ReleaseTag,
+		manifest.GeoIP.Repository,
+		manifest.GeoIP.ReleaseTag,
+		manifest.Artifacts.GeositeRuleSetCount,
+		manifest.Artifacts.GeoIPRuleSetCount,
+		manifest.Artifacts.GeositeDirectory,
+		manifest.Artifacts.GeoIPDirectory,
+		manifest.Artifacts.GeositeBranch,
+		manifest.Artifacts.GeoIPBranch,
+	)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+
+	return ""
+}
